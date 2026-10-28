@@ -37,6 +37,12 @@ CI uses the LATEST stable toolchain (`dtolnay/rust-toolchain@stable`), so a stal
 `try_update`, which is also newer than our `rust-version = 1.89` MSRV — rewrite instead of
 renaming). Run `rustup update stable` (or `cargo +<latest> clippy`) before tagging a release.
 
+Run `cargo test` with a SHORT private `TMPDIR` outside the Git tree (e.g. `mktemp -d /tmp/hst.XXXX`):
+tests create scratch git repos and Unix sockets under the temp dir, so a temp dir nested in
+`target/` breaks git discovery and a long path overflows the Unix socket path limit. Also unset
+live `HERDR_*` session variables and point `HERDR_PLUGIN_STATE_DIR` / `XDG_STATE_HOME` /
+`XDG_CONFIG_HOME` at disposable dirs so tests never touch a real session or `state.json`.
+
 `plugins/herdr-sidebar/scripts/.gitattributes` pins every shell script to LF. The
 repository has Windows contributors and `core.autocrlf` is common, but these files are
 executed by Bash on Linux/macOS and mixed or CRLF endings fail before the launcher runs.
@@ -1099,6 +1105,42 @@ It replaced the original pane-ID-keyed park/restore implementation; the optional
   otherwise searches cwd first), and extraction has a 4s timeout plus a 16 MiB output cap.
   Images stop at 32 MiB encoded / 12 megapixels / 64 MiB decoder allocation. Without `ffmpeg`,
   the pane shows a capability message rather than launching an external app. Media stays read-only.
+- `.csv`/`.tsv` (case-insensitive, nothing else) optionally render through `tidy-viewer` — never
+  the `tv` alias, which collides with other tools. Fixed argv `-a -p -s <,|TAB> -n 5000 -g 7`
+  (`-c 5` on the light theme), no `-e`, so tidy fits the pane and names the columns it hid; the
+  already-read MAX_BYTES/MAX_LINES buffer (cut at a physical-line boundary, not a validated CSV
+  record) goes in on stdin, the file is
+  never touched. `run_bounded` covers input delivery, child exit and stdout EOF with one 4s
+  deadline and an 8 MiB output cap, never joins pipe threads (a grandchild can hold a pipe:
+  crossterm may spawn `tput`), and caps those threads at two groups via `InFlight` (run_bounded keeps its own slot Arc until
+  the child is reaped, so a child that closes its pipes and hangs still counts). Any failure,
+  timeout, `-p` rejection (ragged rows; `-p` does NOT reject every malformed CSV — an unterminated quote
+  `a,b\n1,"first line\n` exited 0 with a table), or empty/ANSI-only output falls back to the normal source
+  preview. tidy is LOSSY (`00123`→`123`, `123.456789012345`→`123.4567` even at `-g 7`, cells
+  truncated), so `t` swaps to the exact source; rows do not map, so a swap resets scroll and
+  selection. The choice is the doc's `source_view`, kept independently of whether a table exists
+  and applied when a load/refresh RESULT lands, so it survives width reloads, a failed render and
+  the later recovery; an unchanged table still adopts a changed hidden source. A failed render has
+  no `render_width`, so nothing retries it: the fallback stays until the file's mtime/size changes
+  (the 2s file poll reloads) or the file is loaded again. A width reload that fails while the
+  source is chosen keeps that source's scroll and `w`. Docs without a table (glow markdown) keep
+  the original refresh carry-over of `w` and source line. Line-target opens
+  never run tidy. A user `tv.toml` can still override defaults (tidy has no config-disable flag).
+- tidy sizes itself from the controlling terminal, not a width flag. Two separate WSL (Herdr 0.9.5)
+  checks. (1) An earlier Python-harness subprocess probe (not the viewer): a child with captured
+  stdin/stdout and null stderr, inside a pane, rendered CSV and explicit-tab TSV even with no
+  `TERM`/`tput`, because the pane's controlling tty remains; detached with no terminal it panics in
+  `size().unwrap()` (→ source fallback). (2) A fresh release viewer (`--preview` in a disposable
+  tab, isolated `HERDR_PLUGIN_STATE_DIR`, empty `HERDR_PANE_ID`): mixed-case `.CSV` and `.tsv`
+  rendered an ANSI table with rounded numbers; `t` showed exact `00123`/`123.456789012345`; `e`
+  edited the same exact text and left the file bytes unchanged; an external edit to a
+  source-selected TSV refreshed in ~2s, stayed on source, and `t` showed the updated table; narrow
+  and wide resizes kept table/toggle working; ragged `a,b\n1,2,3` and a viewer with tidy
+  off `PATH` fell back to source; `.xlsx` stayed source; a line-target open (`file/…csv` line 31)
+  showed source at row 31 with no table. The no-`TERM` case was NOT repeated in the real viewer.
+  macOS/Windows are unverified, and Windows keeps CREATE_NO_WINDOW, so it may fall back to source.
+  Capture gotcha: `pane read --source visible --lines N` returns the TAIL of the visible screen, so
+  N below the pane height hides the top fixture rows — read the full visible screen when asserting.
 
 ### Syntax highlighting (file preview)
 
