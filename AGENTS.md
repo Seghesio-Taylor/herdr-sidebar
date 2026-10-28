@@ -1103,6 +1103,19 @@ It replaced the original pane-ID-keyed park/restore implementation; the optional
   for a bounded first-frame PNG and render it through the same path; lookup resolves an absolute
   executable from PATH while rejecting relative/project-local entries (Windows process lookup
   otherwise searches cwd first), and extraction has a 4s timeout plus a 16 MiB output cap.
+  "Project-local" is NOT simply "under cwd": a Herdr preview inherits its SPAWN cwd, which is
+  often `$HOME` even while viewing a file deep in some project, so an under-cwd rule rejected
+  every user-installed `~/.local/bin/tidy-viewer` and CSV previews silently stayed raw. The
+  shared `program_in_path` therefore trusts exactly `~/.local/bin` and `~/.cargo/bin`
+  (`USERPROFILE` on Windows), only when cwd IS the canonical home and only when each dir
+  canonicalizes to itself; the resolved executable is canonicalized and must lie outside cwd or
+  directly in a trusted dir, so dir or binary symlinks into a project stay rejected. Unit-tested
+  with a fake home (tidy-viewer + ffmpeg). Verified live on WSL (Herdr 0.9.5): a fresh release
+  viewer in a disposable tab with cwd = the real `$HOME` (HOME intact, isolated state, metadata
+  identity disabled) rendered a synthetic CSV as a table, and `t` showed the exact `00123` and
+  full-precision values; seven private local CSV files (including archived copies), opened
+  read-only, all rendered as tables with their hashes unchanged and no content copied into the
+  repo. The test tab and fixtures were removed afterward. macOS/Windows remain unverified.
   Images stop at 32 MiB encoded / 12 megapixels / 64 MiB decoder allocation. Without `ffmpeg`,
   the pane shows a capability message rather than launching an external app. Media stays read-only.
 - `.csv`/`.tsv` (case-insensitive, nothing else) optionally render through `tidy-viewer` — never

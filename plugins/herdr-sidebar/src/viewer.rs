@@ -1494,18 +1494,55 @@ fn decode_image_file(target: &Path) -> Result<image::RgbaImage, String> {
         .map_err(|error| error.to_string())
 }
 
-/// `program` (no extension) in an absolute PATH entry outside `cwd`.
-fn program_in_path(program: &str, path: &std::ffi::OsStr, cwd: Option<&Path>) -> Option<PathBuf> {
+/// Per-user install dirs trusted inside `cwd` only when `cwd` IS the home
+/// directory (Herdr previews inherit the spawn cwd, commonly `~`). Each must
+/// canonicalize to itself under the canonical home, so a symlinked alias into a
+/// project is not trusted.
+fn home_tool_dirs(home: Option<&Path>, cwd: Option<&Path>) -> Vec<PathBuf> {
+    let Some(home) = home
+        .filter(|home| home.is_absolute())
+        .and_then(|home| home.canonicalize().ok())
+    else {
+        return Vec::new();
+    };
+    if cwd != Some(home.as_path()) {
+        return Vec::new();
+    }
+    [[".local", "bin"], [".cargo", "bin"]]
+        .iter()
+        .map(|parts| home.join(parts[0]).join(parts[1]))
+        .filter(|dir| dir.canonicalize().is_ok_and(|real| &real == dir))
+        .collect()
+}
+
+/// `program` (no extension) in an absolute PATH entry outside `cwd`, or in a
+/// verified [`home_tool_dirs`] entry. Returns the canonical executable, which
+/// must itself resolve outside `cwd` or directly into a trusted dir.
+fn program_in_path(
+    program: &str,
+    path: &std::ffi::OsStr,
+    cwd: Option<&Path>,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
     let executable = if cfg!(windows) {
         format!("{program}.exe")
     } else {
         program.to_string()
     };
+    let trusted = home_tool_dirs(home, cwd);
+    let allowed = |path: &Path, dir: &Path| {
+        !cwd.is_some_and(|cwd| path.starts_with(cwd)) || trusted.iter().any(|t| t == dir)
+    };
     std::env::split_paths(path)
         .filter(|directory| directory.is_absolute())
         .filter_map(|directory| directory.canonicalize().ok())
-        .filter(|directory| !cwd.is_some_and(|cwd| directory.starts_with(cwd)))
-        .map(|directory| directory.join(&executable))
+        .filter(|directory| allowed(directory, directory))
+        .filter_map(|directory| directory.join(&executable).canonicalize().ok())
+        .filter(|candidate| {
+            candidate
+                .parent()
+                .is_some_and(|dir| allowed(candidate, dir))
+        })
         .find(|candidate| {
             if !candidate.is_file() {
                 return false;
@@ -1527,7 +1564,10 @@ fn program_on_path(program: &str) -> Option<PathBuf> {
     let cwd = std::env::current_dir()
         .ok()
         .and_then(|path| path.canonicalize().ok());
-    program_in_path(program, &path, cwd.as_deref())
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from);
+    program_in_path(program, &path, cwd.as_deref(), home.as_deref())
 }
 
 fn decode_video_poster(target: &Path) -> Result<image::RgbaImage, String> {
@@ -4206,8 +4246,125 @@ mod tests {
         let search_path = std::env::join_paths([&local_bin, &external_bin]).unwrap();
         let project = project.canonicalize().unwrap();
         assert_eq!(
-            program_in_path("ffmpeg", &search_path, Some(&project)),
+            program_in_path("ffmpeg", &search_path, Some(&project), None),
             Some(external_bin.canonicalize().unwrap().join(executable))
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn fake_tool(directory: &Path, program: &str) -> PathBuf {
+        std::fs::create_dir_all(directory).unwrap();
+        let file = directory.join(if cfg!(windows) {
+            format!("{program}.exe")
+        } else {
+            program.to_string()
+        });
+        std::fs::write(&file, b"placeholder").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        file.canonicalize().unwrap()
+    }
+
+    /// Herdr previews run with cwd = the spawn dir, often `~`: user-installed
+    /// tools in `~/.local/bin` / `~/.cargo/bin` must resolve, nothing else in
+    /// home may.
+    #[test]
+    fn tool_lookup_trusts_only_standard_user_bins_when_cwd_is_home() {
+        let root = std::env::temp_dir().join(format!("viewer-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("home");
+        let local = home.join(".local").join("bin");
+        let cargo = home.join(".cargo").join("bin");
+        let project_tools = home.join("project").join("tools");
+        let external = root.join("external");
+        let path = |dirs: &[&PathBuf]| std::env::join_paths(dirs).unwrap();
+        for program in ["tidy-viewer", "ffmpeg"] {
+            let installed = fake_tool(&local, program);
+            fake_tool(&project_tools, program);
+            let cargo_tool = fake_tool(&cargo, program);
+            let outside = fake_tool(&external, program);
+            let cwd = home.canonicalize().unwrap();
+            let find = |search: &std::ffi::OsStr, home_dir: Option<&Path>| {
+                program_in_path(program, search, Some(&cwd), home_dir)
+            };
+            // The reported bug: without the home exception nothing resolves.
+            assert_eq!(find(&path(&[&local]), None), None);
+            assert_eq!(find(&path(&[&local]), Some(&home)), Some(installed.clone()));
+            assert_eq!(find(&path(&[&cargo]), Some(&home)), Some(cargo_tool));
+            // A project dir under home is still never trusted, even first.
+            assert_eq!(
+                find(&path(&[&project_tools, &local]), Some(&home)),
+                Some(installed.clone())
+            );
+            assert_eq!(find(&path(&[&project_tools]), Some(&home)), None);
+            // Relative and empty PATH entries never count.
+            let relative = std::env::join_paths([Path::new(""), Path::new(".local/bin")]).unwrap();
+            assert_eq!(find(&relative, Some(&home)), None);
+            // A real project cwd keeps the old rule; outside tools still resolve.
+            let project = home.join("project").canonicalize().unwrap();
+            assert_eq!(
+                program_in_path(
+                    program,
+                    &path(&[&project_tools]),
+                    Some(&project),
+                    Some(&home)
+                ),
+                None
+            );
+            assert_eq!(
+                program_in_path(
+                    program,
+                    &path(&[&project_tools, &external]),
+                    Some(&project),
+                    Some(&home)
+                ),
+                Some(outside)
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn home_tool_symlinks_into_projects_stay_rejected() {
+        let root = std::env::temp_dir().join(format!("viewer-home-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("home");
+        let project_tools = home.join("project").join("tools");
+        let project_tool = fake_tool(&project_tools, "tidy-viewer");
+        let cwd_home = home.canonicalize().unwrap();
+        // Directory alias: ~/.local/bin -> ~/project/tools.
+        std::fs::create_dir_all(home.join(".local")).unwrap();
+        std::os::unix::fs::symlink(&project_tools, home.join(".local").join("bin")).unwrap();
+        let local = std::env::join_paths([home.join(".local").join("bin")]).unwrap();
+        assert_eq!(
+            program_in_path("tidy-viewer", &local, Some(&cwd_home), Some(&home)),
+            None
+        );
+        // Executable alias: ~/.cargo/bin/tidy-viewer -> ~/project/tools/tidy-viewer.
+        let cargo = home.join(".cargo").join("bin");
+        std::fs::create_dir_all(&cargo).unwrap();
+        std::os::unix::fs::symlink(&project_tool, cargo.join("tidy-viewer")).unwrap();
+        let cargo_path = std::env::join_paths([&cargo]).unwrap();
+        assert_eq!(
+            program_in_path("tidy-viewer", &cargo_path, Some(&cwd_home), Some(&home)),
+            None
+        );
+        // The same alias from a non-home cwd is rejected too.
+        let project = home.join("project").canonicalize().unwrap();
+        assert_eq!(
+            program_in_path("tidy-viewer", &cargo_path, Some(&project), Some(&home)),
+            None
+        );
+        // A valid external program reached through a trusted dir symlink still works.
+        let external = fake_tool(&root.join("external"), "ffmpeg");
+        std::os::unix::fs::symlink(&external, cargo.join("ffmpeg")).unwrap();
+        assert_eq!(
+            program_in_path("ffmpeg", &cargo_path, Some(&cwd_home), Some(&home)),
+            Some(external)
         );
         std::fs::remove_dir_all(root).unwrap();
     }
