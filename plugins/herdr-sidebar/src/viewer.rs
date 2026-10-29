@@ -389,8 +389,8 @@ struct Doc {
     /// The representation NOT on screen for a CSV/TSV table: the exact source
     /// while the table shows, the table while the source shows. `t` swaps.
     alternate: Option<Vec<Line<'static>>>,
-    /// The user asked for the exact source instead of the lossy table. Kept
-    /// even while no table exists (renderer failed), so a later successful
+    /// The exact source is selected instead of the lossy table. Kept even
+    /// while no table exists (renderer failed), so a later successful
     /// refresh honours it.
     source_view: bool,
     /// `lines` laid out for the pane, rebuilt only when the width or the
@@ -4290,7 +4290,7 @@ mod tests {
             let find = |search: &std::ffi::OsStr, home_dir: Option<&Path>| {
                 program_in_path(program, search, Some(&cwd), home_dir)
             };
-            // The reported bug: without the home exception nothing resolves.
+            // With cwd = home, a home tool dir is trusted only when home is known.
             assert_eq!(find(&path(&[&local]), None), None);
             assert_eq!(find(&path(&[&local]), Some(&home)), Some(installed.clone()));
             assert_eq!(find(&path(&[&cargo]), Some(&home)), Some(cargo_tool));

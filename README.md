@@ -49,8 +49,9 @@ Use the mouse or press `1`, `2`, and `3`.
   working panes move to a temporary tab while you preview; Esc / `q` brings them back.
 - Preview text, Markdown, images, and—when `ffmpeg` is available—video poster frames.
   With `tidy-viewer` on `PATH`, `.csv`/`.tsv` files open as a fitted table; the table is lossy
-  (numbers rounded, cells cut), so `t` toggles to the exact source and back. Missing tool,
-  errors, timeouts (4s), or data tidy rejects fall back to the source preview. Verified live on Linux (WSL) only so far.
+  (numbers rounded, cells truncated), so `t` toggles to the exact source and back. If the tool
+  is missing, fails, times out (4s), or rejects the data, the source preview is shown instead.
+  Table previews have been verified on Linux (WSL) only.
   Read-only previews support mouse selection and clipboard copy, including OSC 52 over SSH,
   and reload on their own when the file changes on disk.
 - Find files with `Ctrl+P`; search project contents with `Ctrl+F` or `Ctrl+Shift+F`.
